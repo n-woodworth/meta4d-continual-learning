@@ -1,0 +1,714 @@
+"""
+Homeostatic Regulation of Neural Network Topology for Continual Learning
+
+This implementation demonstrates how adaptive network topology through Hebbian-inspired
+neurogenesis and homeostatic pruning can mitigate catastrophic forgetting in continual
+learning scenarios.
+
+Key Innovations:
+1. Hebbian Block Spawning: Creates new connections based on correlation between 
+   layer inputs and error gradients
+2. Homeostatic Controller: Maintains network capacity (biomass) through adaptive
+   SPAWN/PRUNE decisions based on learning stress
+3. Block-wise Sparsity: Operates on blocks of weights for computational efficiency
+
+Architecture: MLP with bottleneck (can be adapted to Transformers)
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+import copy
+import random
+from typing import Dict, Any, List
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+
+
+# ============================================================================
+# 1. HEBBIAN BLOCK MASKING - Adaptive Sparse Topology
+# ============================================================================
+
+class BlockHebbianMasking:
+    """
+    Manages sparse connectivity through block-wise masking with Hebbian-inspired
+    connection growth.
+    
+    Key Concepts:
+    - HEBBIAN LEARNING: "Neurons that fire together, wire together"
+      We spawn new connections where input-output correlations are strongest
+    - BLOCK SPARSITY: Operate on blocks (e.g., 16x16) rather than individual weights
+      for computational efficiency
+    - TABOO MECHANISM: Prevent recently-spawned connections from being immediately
+      pruned to allow them to stabilize
+    """
+    
+    def __init__(self, model: nn.Module, block_size: int = 16, dormant_ratio: float = 0.7):
+        """
+        Args:
+            model: Neural network to sparsify
+            block_size: Size of weight blocks (e.g., 16 means 16x16 blocks)
+            dormant_ratio: Initial fraction of blocks to mask (0.7 = 70% sparse)
+        """
+        self.masks: Dict[str, torch.Tensor] = {}
+        self.taboo_masks: Dict[str, torch.Tensor] = {}  # Prevent premature pruning
+        self.synaptic_importance: Dict[str, torch.Tensor] = {}  # Track weight importance
+        self.layer_inputs: Dict[str, torch.Tensor] = {}  # For Hebbian spawning
+        self.layer_grads: Dict[str, torch.Tensor] = {}   # For Hebbian spawning
+        self.block_size = block_size
+        self.recording = False
+        
+        # Initialize masks for all weight matrices
+        for name, param in model.named_parameters():
+            if 'workspace' in name:
+                continue  # Skip bottleneck layer
+            if 'weight' in name and param.dim() > 1:
+                rows, cols = param.shape
+                if rows % block_size != 0 or cols % block_size != 0:
+                    continue  # Skip non-divisible layers
+                
+                # Create block mask
+                n_rows_b = rows // block_size
+                n_cols_b = cols // block_size
+                mask_b = torch.ones((n_rows_b, n_cols_b))
+                
+                # Randomly mask dormant_ratio of blocks
+                num_dormant = int(mask_b.numel() * dormant_ratio)
+                indices = torch.randperm(mask_b.numel())[:num_dormant]
+                mask_b.view(-1)[indices] = 0.0
+                
+                # Expand to full weight dimensions
+                mask_full = self._expand_mask(mask_b, rows, cols).to(param.device)
+                self.masks[name] = mask_full
+                self.taboo_masks[name] = torch.zeros_like(mask_b).to(param.device)
+                self.synaptic_importance[name] = param.abs().detach().clone()
+                
+                # Apply initial mask
+                param.data *= self.masks[name]
+        
+        self._register_hooks(model)
+
+    def _expand_mask(self, block_mask, rows, cols):
+        """Expand block mask to full weight dimensions"""
+        return block_mask.repeat_interleave(self.block_size, dim=0).repeat_interleave(self.block_size, dim=1)
+
+    def _register_hooks(self, model: nn.Module):
+        """
+        Register forward/backward hooks to capture layer inputs and gradients.
+        Uses closures for O(1) lookup instead of O(N) search.
+        """
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                param_name = f"{name}.weight"
+                if param_name in self.masks:
+                    
+                    def forward_hook(mod, input, output, p_name=param_name):
+                        if not self.recording:
+                            return
+                        self.layer_inputs[p_name] = input[0].detach()
+
+                    def backward_hook(mod, grad_input, grad_output, p_name=param_name):
+                        if not self.recording:
+                            return
+                        self.layer_grads[p_name] = grad_output[0].detach()
+
+                    module.register_forward_hook(forward_hook)
+                    module.register_full_backward_hook(backward_hook)
+
+    def enforce(self, model: nn.Module):
+        """
+        Enforce sparsity masks and update synaptic importance.
+        Called after each optimizer step.
+        """
+        for name, param in model.named_parameters():
+            if name in self.masks:
+                mask = self.masks[name]
+                
+                # Enforce mask on weights and gradients
+                param.data *= mask
+                if param.grad is not None:
+                    param.grad *= mask
+                
+                # Decay taboo (allow old spawns to be prunable)
+                if name in self.taboo_masks:
+                    self.taboo_masks[name] = torch.clamp(self.taboo_masks[name] - 0.01, min=0)
+                
+                # Update synaptic importance (max of current and historical)
+                current_imp = param.abs().detach()
+                if param.grad is not None:
+                    current_imp += param.grad.abs().detach()
+                
+                self.synaptic_importance[name] = torch.max(
+                    self.synaptic_importance[name] * 0.9995,  # Decay factor
+                    current_imp
+                )
+
+    def clear_buffers(self):
+        """Clear captured inputs/gradients to free memory"""
+        self.layer_inputs.clear()
+        self.layer_grads.clear()
+
+    def hebbian_block_spawn(self, model, intensity, init_scale=0.01):
+        """
+        HEBBIAN SPAWNING: Create new connections where they're most needed.
+        
+        The core insight: If a layer's input is strongly correlated with the error
+        gradient (∂L/∂output), then those input features should influence that output.
+        
+        Algorithm:
+        1. Compute "virtual gradient": outer product of layer_input and error_gradient
+        2. Aggregate importance at block level
+        3. Select top-k dormant blocks as candidates for spawning
+        4. Initialize new weights proportional to the virtual gradient
+        
+        This is Hebbian because it strengthens connections between co-activated patterns.
+        
+        Args:
+            model: The network
+            intensity: Fraction of dormant blocks to spawn (0.0-1.0)
+            init_scale: Scale for initializing new weights
+            
+        Returns:
+            Fraction of blocks spawned
+        """
+        total_new, total_blocks = 0, 0
+        
+        for name, param in model.named_parameters():
+            if name not in self.masks or name not in self.layer_inputs:
+                continue
+            
+            rows, cols = param.shape
+            inputs = self.layer_inputs[name]
+            grad_output = self.layer_grads[name]
+            
+            # Handle Conv2d vs Linear dimension differences
+            if inputs.dim() > 2:
+                inputs = inputs.view(inputs.size(0), -1)
+            if grad_output.dim() > 2:
+                grad_output = grad_output.view(grad_output.size(0), -1)
+            
+            # Subsample for efficiency
+            if inputs.size(0) > 1024:
+                inputs = inputs[:1024]
+                grad_output = grad_output[:1024]
+            
+            # HEBBIAN CORRELATION: Compute virtual gradient
+            # This estimates what the gradient would be if all connections existed
+            dense_grad = torch.matmul(grad_output.t(), inputs) / inputs.size(0)
+            
+            # Aggregate to block level
+            n_rows_b, n_cols_b = rows // self.block_size, cols // self.block_size
+            total_blocks += (n_rows_b * n_cols_b)
+            
+            grad_reshaped = dense_grad.view(n_rows_b, self.block_size, n_cols_b, self.block_size)
+            block_imp = grad_reshaped.abs().sum(dim=(1, 3))
+            
+            # Select candidates: dormant blocks not in taboo list
+            curr_b = self.masks[name][::self.block_size, ::self.block_size]
+            candidates = (curr_b == 0) & (self.taboo_masks[name] == 0)
+            scores = block_imp * candidates.float()
+            
+            flat = torch.nonzero(scores.view(-1), as_tuple=False).squeeze()
+            if flat.numel() == 0:
+                continue
+            
+            # Select top-k% by importance
+            k = int(flat.numel() * intensity)
+            if k == 0:
+                continue
+            
+            thresh = torch.topk(scores.view(-1)[flat], k).values[-1]
+            selected = (scores >= thresh) & candidates
+            
+            # Spawn new blocks
+            new_growth = self._expand_mask(selected.float(), rows, cols)
+            self.masks[name] = torch.max(self.masks[name], new_growth)
+            
+            # Initialize with scaled virtual gradient (Hebbian initialization)
+            param.data += new_growth * (-init_scale * dense_grad)
+            
+            total_new += selected.sum().item()
+        
+        return total_new / max(1, total_blocks)
+
+    def smart_block_prune(self, model, intensity):
+        """
+        IMPORTANCE-BASED PRUNING: Remove least important active blocks.
+        
+        Uses accumulated synaptic importance to identify blocks that contribute
+        least to the network's computation. This maintains efficiency while
+        preserving critical pathways.
+        
+        Args:
+            model: The network
+            intensity: Fraction of active blocks to prune (0.0-1.0)
+            
+        Returns:
+            Number of blocks pruned
+        """
+        changes = 0
+        
+        for name, param in model.named_parameters():
+            if name not in self.masks:
+                continue
+            
+            rows, cols = param.shape
+            
+            # Aggregate importance to block level
+            imp_reshaped = self.synaptic_importance[name].view(
+                rows // self.block_size, self.block_size,
+                cols // self.block_size, self.block_size
+            )
+            block_imp = imp_reshaped.sum(dim=(1, 3))
+            
+            # Identify active blocks
+            curr_b = self.masks[name][::self.block_size, ::self.block_size]
+            active_mask = curr_b == 1
+            
+            if not active_mask.any():
+                continue
+            
+            active_scores = block_imp[active_mask]
+            
+            # Find pruning threshold (bottom intensity% of importance)
+            try:
+                thresh = torch.quantile(active_scores.float(), intensity)
+            except:
+                k = max(1, int(active_scores.numel() * intensity))
+                thresh = torch.kthvalue(active_scores.view(-1), k).values
+            
+            # Prune blocks below threshold
+            to_prune = (block_imp < thresh) & active_mask
+            prune_mask = self._expand_mask(to_prune.float(), rows, cols)
+            self.masks[name] *= (1.0 - prune_mask)
+            param.data *= self.masks[name]
+            
+            changes += to_prune.sum().item()
+        
+        return changes
+
+    def mark_taboo(self, old_mask_dict):
+        """Mark newly-spawned blocks as taboo to prevent immediate pruning"""
+        for name, current in self.masks.items():
+            if name not in old_mask_dict:
+                continue
+            curr_b = current[::self.block_size, ::self.block_size]
+            old_b = old_mask_dict[name][::self.block_size, ::self.block_size]
+            spawned = (curr_b == 1) & (old_b == 0)
+            self.taboo_masks[name][spawned] = 5.0  # Taboo for ~500 steps
+
+
+# ============================================================================
+# 2. HOMEOSTATIC CONTROLLER - Maintaining Network Capacity
+# ============================================================================
+
+class GeneralizingController:
+    """
+    HOMEOSTATIC REGULATION: Maintain network capacity around a target "biomass".
+    
+    Biological Inspiration:
+    Just as organisms maintain homeostasis (stable internal conditions despite
+    external changes), this controller maintains stable network capacity while
+    adapting to new tasks.
+    
+    Key Mechanisms:
+    1. Stress Detection: Monitor loss trends to detect learning difficulty
+    2. Adaptive Response: SPAWN when stressed, PRUNE when overgrowing
+    3. Exploration: Periodic spawning prevents local minima
+    
+    The controller uses exponential moving averages to smooth noisy signals
+    and make stable decisions.
+    """
+    
+    def __init__(self, target_biomass=0.3, verbose=False):
+        """
+        Args:
+            target_biomass: Target fraction of active connections (0.3 = 30% dense)
+            verbose: Print debug information
+        """
+        self.target_biomass = target_biomass
+        self.M_t, self.M_bar = 0.5, 0.5  # Short-term and long-term stress
+        self.checkpoint = None
+        self.consecutive_failures = 0
+        self.avg_loss = 0.0
+        self.loss_trend = 0.0
+        self.recent_growth = 0.0
+        self.first = True
+        self.step_counter = 0
+        self.verbose = verbose
+        self.spawn_count = 0
+        self.prune_count = 0
+
+    def save_checkpoint(self, masker):
+        """Save current masks for potential revert"""
+        self.checkpoint = copy.deepcopy(masker.masks)
+    
+    def revert(self, masker):
+        """Revert to checkpoint and mark failed spawns as taboo"""
+        if self.checkpoint:
+            masker.mark_taboo(self.checkpoint)
+            masker.masks = copy.deepcopy(self.checkpoint)
+            self.consecutive_failures += 1
+            self.recent_growth = 0.0
+            return "REVERTED"
+        return "REVERT FAIL"
+
+    def observe(self, loss, biomass, new_growth):
+        """
+        HOMEOSTATIC DECISION MAKING
+        
+        This is the "brain" of the system. It observes the current state
+        (loss, biomass, recent growth) and decides whether to:
+        - SPAWN: Add capacity when learning is difficult
+        - PRUNE: Remove excess when overgrowing
+        - REVERT: Undo recent changes if they hurt performance
+        - None: Do nothing (stable state)
+        
+        The decision uses:
+        1. Loss trends: Is learning getting harder?
+        2. Biomass: Are we above/below target capacity?
+        3. Growth history: Did recent spawning help or hurt?
+        
+        Args:
+            loss: Current training loss
+            biomass: Current fraction of active weights
+            new_growth: Fraction of blocks spawned in last action
+            
+        Returns:
+            (action, intensity) tuple where action ∈ {None, 'SPAWN', 'PRUNE', 'REVERT'}
+        """
+        self.step_counter += 1
+        
+        # Initialize on first call
+        if self.first:
+            self.avg_loss = loss
+            self.first = False
+        
+        # Update growth tracker (exponential moving average)
+        self.recent_growth = 0.8 * self.recent_growth + 0.2 * new_growth
+        
+        # Safety check: Revert on NaN or collapsed network
+        if np.isnan(loss) or np.isinf(loss) or biomass < 0.01:
+            return 'REVERT', 0.0
+        
+        # Update loss statistics
+        self.avg_loss = 0.9 * self.avg_loss + 0.1 * loss
+        trend = loss - self.avg_loss
+        self.loss_trend = 0.9 * self.loss_trend + 0.1 * trend
+        
+        # Panic mode: Loss exploding and not improving
+        panic = max(5.0, self.avg_loss * 3.0)
+        stagnant = self.loss_trend > -0.01
+        if loss > panic and stagnant:
+            return 'REVERT', 0.0
+        
+        # Compute "effective stress" with growth tax
+        # Tax penalizes excessive growth to prevent runaway expansion
+        tax = self.recent_growth * 2.0
+        effective_stress = loss + tax
+        
+        # Update stress metrics (two timescales)
+        self.M_t = 0.2 * effective_stress + 0.8 * self.M_t      # Fast (short-term)
+        self.M_bar = 0.05 * self.M_t + 0.95 * self.M_bar        # Slow (long-term)
+        
+        # "Homeostatic potential" = deviation from equilibrium
+        potential = self.M_t - self.M_bar
+        
+        # Calculate action intensity based on potential
+        intensity = min(0.2, abs(potential) * 0.5)
+        if self.recent_growth > 0.05:
+            intensity *= 0.5  # Reduce if we just grew
+        
+        # Debug logging
+        if self.verbose and self.step_counter % 100 == 0:
+            print(f"  [Controller] Step {self.step_counter}: M_t={self.M_t:.3f}, M_bar={self.M_bar:.3f}, "
+                  f"potential={potential:.3f}, bio={biomass:.3f}, growth={self.recent_growth:.3f}")
+        
+        # PERIODIC EXPLORATION: Force small spawns to prevent stagnation
+        if self.step_counter % 500 == 0 and biomass < 0.8:
+            self.spawn_count += 1
+            return 'SPAWN', 0.05
+        
+        # HOMEOSTATIC ACTION SELECTION
+        # Threshold lowered to 0.05 for more reactive control
+        if abs(potential) > 0.05:
+            if self.M_t > self.M_bar:  # Short-term stress exceeds baseline
+                if self.recent_growth < 0.1:  # Not growing too fast
+                    self.spawn_count += 1
+                    return 'SPAWN', intensity
+            elif self.M_t < self.M_bar:  # Stress below baseline (network slack)
+                if biomass > self.target_biomass:  # Above target capacity
+                    self.prune_count += 1
+                    return 'PRUNE', intensity
+        
+        return None, 0.0
+
+
+# ============================================================================
+# 3. NETWORK ARCHITECTURE
+# ============================================================================
+
+class WorkspaceNet(nn.Module):
+    """
+    Simple MLP with bottleneck for continual learning experiments.
+    
+    Architecture: Input → Enc1 → Enc2 → Workspace (bottleneck) → Dec1 → Dec2 → Output
+    
+    The bottleneck creates an information constraint that forces the network
+    to learn compressed representations.
+    """
+    
+    def __init__(self, input_dim=784, hidden_dim=256, bottleneck_dim=128, output_dim=10):
+        super().__init__()
+        self.enc1 = nn.Linear(input_dim, hidden_dim)
+        self.enc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.workspace = nn.Linear(hidden_dim, bottleneck_dim)  # Bottleneck
+        self.dec1 = nn.Linear(bottleneck_dim, hidden_dim)
+        self.dec2 = nn.Linear(hidden_dim, output_dim)
+    
+    def forward(self, x, return_repr=False):
+        x = x.view(x.size(0), -1)
+        h = F.relu(self.enc1(x))
+        h = F.relu(self.enc2(h))
+        w = F.relu(self.workspace(h))  # Bottleneck representation
+        h2 = F.relu(self.dec1(w))
+        out = self.dec2(h2)
+        return (out, w) if return_repr else out
+
+
+# ============================================================================
+# 4. UTILITY FUNCTIONS
+# ============================================================================
+
+def augment(x):
+    """Simple noise augmentation for consistency regularization"""
+    return x + torch.randn_like(x) * 0.05
+
+def evaluate(model, test_loader, perm, device, task_id):
+    """Evaluate model on a single task"""
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for x, y in test_loader:
+            x = x.view(-1, 784)[:, perm].to(device)
+            y = y.to(device)
+            pred = model(x).argmax(dim=1)
+            correct += (pred == y).sum().item()
+    model.train()
+    return correct / len(test_loader.dataset)
+
+def set_global_seed(seed):
+    """Set all random seeds for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================================
+# 5. EXPERIMENT CONFIGURATION
+# ============================================================================
+
+NUM_TASKS = 5
+EPOCHS_PER_TASK = 5
+BATCH_SIZE = 64
+INPUT_DIM = 784
+
+
+# ============================================================================
+# 6. BASELINE EXPERIMENT
+# ============================================================================
+
+def run_baseline(device, seed, train_loader, test_loaders, perms):
+    """
+    Baseline: Dense, static network with no sparsity or adaptation.
+    Demonstrates catastrophic forgetting in standard continual learning.
+    """
+    set_global_seed(seed)
+    print("\n=== RUNNING BASELINE (Dense, Static) on Permuted MNIST ===")
+    
+    model = WorkspaceNet().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    loss_fn = nn.CrossEntropyLoss()
+    
+    after_task_accs = []
+    
+    for task in range(NUM_TASKS):
+        print(f"\nTask {task+1}/{NUM_TASKS}")
+        perm = perms[task]
+        
+        for epoch in range(EPOCHS_PER_TASK):
+            for x, y in train_loader:
+                x = x.view(-1, INPUT_DIM)[:, perm].to(device)
+                y = y.to(device)
+                pred = model(x)
+                loss = loss_fn(pred, y)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            
+            print(f"Task {task+1} Ep {epoch+1} | Loss: {loss.item():.4f}")
+        
+        # Evaluate on all tasks seen so far
+        task_accs = [evaluate(model, test_loaders[t], perms[t], device, t) 
+                     for t in range(task+1)]
+        after_task_accs.append(task_accs)
+        print(f"After Task {task+1}: Accs on tasks 0-{task}: {task_accs}")
+    
+    return after_task_accs
+
+
+# ============================================================================
+# 7. META4D EXPERIMENT (Homeostatic + Hebbian)
+# ============================================================================
+
+def run_meta4d(device, seed, train_loader, test_loaders, perms):
+    """
+    Meta4D: Sparse, adaptive network with Hebbian spawning and homeostatic control.
+    Demonstrates mitigation of catastrophic forgetting through adaptive topology.
+    """
+    set_global_seed(seed)
+    print("\n=== RUNNING META4D (Sparse, Adaptive) on Permuted MNIST ===")
+    
+    model = WorkspaceNet().to(device)
+    masker = BlockHebbianMasking(model, block_size=16, dormant_ratio=0.7)
+    brain = GeneralizingController(target_biomass=0.3, verbose=False)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    loss_fn = nn.CrossEntropyLoss()
+    
+    after_task_accs = []
+    last_growth = 0.0
+    
+    for task in range(NUM_TASKS):
+        print(f"\nTask {task+1}/{NUM_TASKS}")
+        perm = perms[task]
+        
+        for epoch in range(EPOCHS_PER_TASK):
+            for x, y in train_loader:
+                x_perm = x.view(-1, INPUT_DIM)[:, perm].to(device)
+                y = y.to(device)
+                masker.enforce(model)
+                
+                # Clean pass (for task loss)
+                masker.recording = True
+                pred, z_clean = model(x_perm, return_repr=True)
+                task_loss = loss_fn(pred, y)
+                
+                # Noisy pass (for consistency regularization)
+                masker.recording = False
+                x_aug = augment(x_perm)
+                _, z_noisy = model(x_aug, return_repr=True)
+                cons_loss = nn.MSELoss()(z_clean, z_noisy)
+                
+                total_loss = task_loss + 0.5 * cons_loss
+                
+                # Backward pass (record gradients for Hebbian spawning)
+                optimizer.zero_grad()
+                masker.recording = True
+                total_loss.backward()
+                masker.enforce(model)
+                optimizer.step()
+                
+                # HOMEOSTATIC CONTROL: Observe and act
+                act = sum(m.sum() for m in masker.masks.values())
+                tot = sum(m.numel() for m in masker.masks.values()) if masker.masks else 1
+                bio = act / tot if tot > 0 else 0.0
+                
+                op, intensity = brain.observe(total_loss.item(), bio, last_growth)
+                last_growth = 0.0
+                
+                msg = ""
+                if op == 'SPAWN':
+                    brain.save_checkpoint(masker)
+                    last_growth = masker.hebbian_block_spawn(model, intensity)
+                    msg = f"SPAWN {last_growth:.2f}"
+                elif op == 'PRUNE':
+                    brain.save_checkpoint(masker)
+                    masker.smart_block_prune(model, intensity)
+                    msg = "PRUNE"
+                elif op == 'REVERT':
+                    msg = brain.revert(masker)
+                
+                masker.clear_buffers()
+            
+            print(f"Task {task+1} Ep {epoch+1} | Loss: {total_loss.item():.4f} | {msg}")
+        
+        # Evaluate on all tasks seen so far
+        task_accs = [evaluate(model, test_loaders[t], perms[t], device, t) 
+                     for t in range(task+1)]
+        after_task_accs.append(task_accs)
+        print(f"After Task {task+1}: Accs on tasks 0-{task}: {task_accs}")
+    
+    # Print controller statistics
+    print(f"\n[Meta4D Controller Stats] SPAWN actions: {brain.spawn_count}, "
+          f"PRUNE actions: {brain.prune_count}")
+    
+    return after_task_accs
+
+
+# ============================================================================
+# 8. MAIN EXPERIMENT
+# ============================================================================
+
+if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    SEED = 42
+    
+    # Generate task permutations (Permuted MNIST)
+    set_global_seed(SEED)
+    perms = [torch.randperm(INPUT_DIM) for _ in range(NUM_TASKS)]
+    
+    # Load MNIST dataset
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
+    test_dataset = datasets.MNIST('./data', train=False, download=True, transform=transform)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    test_loaders = [DataLoader(test_dataset, batch_size=1000, shuffle=False) 
+                    for _ in range(NUM_TASKS)]
+    
+    # Run experiments
+    print("\n" + "="*80)
+    print("HOMEOSTATIC REGULATION OF NEURAL TOPOLOGY FOR CONTINUAL LEARNING")
+    print("="*80)
+    
+    after_base = run_baseline(device, SEED, train_loader, test_loaders, perms)
+    after_meta = run_meta4d(device, SEED, train_loader, test_loaders, perms)
+    
+    # Compute metrics
+    final_base = after_base[-1]
+    final_meta = after_meta[-1]
+    
+    bwt_base = 0.0
+    bwt_meta = 0.0
+    if NUM_TASKS > 1:
+        bwt_base = sum(final_base[i] - after_base[i][i] for i in range(NUM_TASKS - 1)) / (NUM_TASKS - 1)
+        bwt_meta = sum(final_meta[i] - after_meta[i][i] for i in range(NUM_TASKS - 1)) / (NUM_TASKS - 1)
+
+    # Print results
+    print("\n" + "="*80)
+    print("FINAL RESULTS SUMMARY")
+    print("="*80)
+    
+    print("\nFinal Task Accuracies (after all 5 tasks):")
+    print(f"Baseline: {[f'{acc:.4f}' for acc in final_base]}")
+    print(f"Meta4D:   {[f'{acc:.4f}' for acc in final_meta]}")
+    
+    print(f"\nBackward Transfer (higher is better):")
+    print(f"Baseline: {bwt_base:.4f}")
+    print(f"Meta4D:   {bwt_meta:.4f}")
+    print(f"Difference: {bwt_meta - bwt_base:+.4f}")
+    
+    avg_base = sum(final_base) / len(final_base)
+    avg_meta = sum(final_meta) / len(final_meta)
+    print(f"\nAverage Final Accuracy:")
+    print(f"Baseline: {avg_base:.4f}")
+    print(f"Meta4D:   {avg_meta:.4f}")
+    print(f"Difference: {avg_meta - avg_base:+.4f}")
+    
+    print("\n" + "="*80)
