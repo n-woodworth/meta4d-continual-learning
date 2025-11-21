@@ -1,0 +1,24 @@
+# Meta4D Requirements
+
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+
+# Transformer support
+transformers>=4.30.0
+datasets>=2.14.0
+
+# Parameter optimization
+scikit-optimize>=0.9.0
+scikit-learn>=1.3.0
+
+# Data processing
+pandas>=2.0.0
+
+# Optional: For faster experiments
+accelerate>=0.20.0
+
+# Optional: For visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
